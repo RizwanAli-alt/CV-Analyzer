@@ -1,0 +1,2472 @@
+this is the 
+
+_init_.py:
+"""
+CV Analyzer Package
+
+This package contains all business logic for CV analysis.
+Designed for both Streamlit and Django integration.
+"""
+
+__version__ = "2.0.0"
+__author__ = "AI CV Analyzer"
+
+gap.py:
+
+"""
+Skill Gap Detection Module.
+
+Identifies missing high-demand skills compared to market requirements.
+
+Fix: market_skills.json path is resolved relative to this file so it works
+regardless of the working directory (important for Django migration later).
+"""
+
+import json
+import logging
+from pathlib import Path
+from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_MARKET_SKILLS = Path(__file__).parent.parent / "models" / "market_skills.json"
+
+
+class GapDetector:
+    """Detect skill gaps against market demand."""
+
+    def __init__(self, market_skills_path: Optional[str] = None):
+        self.market_skills = self._load_market_skills(market_skills_path)
+
+    def _load_market_skills(self, market_skills_path: Optional[str]) -> dict:
+        path = Path(market_skills_path) if market_skills_path else _DEFAULT_MARKET_SKILLS
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            logger.info(f"Loaded market skills from {path}")
+            return data
+        except FileNotFoundError:
+            logger.warning(f"Market skills file not found at {path}")
+            return {"high_demand": [], "emerging": []}
+        except json.JSONDecodeError:
+            logger.warning(f"Invalid JSON in market skills at {path}")
+            return {"high_demand": [], "emerging": []}
+
+    def detect_gaps(self, user_skills: Dict) -> Dict:
+        """
+        Detect skill gaps for user.
+
+        Args:
+            user_skills: {"technical": [...], "soft": [...]}
+
+        Returns:
+            Gap analysis dictionary
+        """
+        if isinstance(user_skills, dict):
+            user_technical = {s.lower() for s in user_skills.get("technical", [])}
+            user_soft = {s.lower() for s in user_skills.get("soft", [])}
+        else:
+            user_technical = set()
+            user_soft = set()
+
+        user_all = user_technical | user_soft
+
+        market_high = {s.lower() for s in self.market_skills.get("high_demand", [])}
+        market_emerging = {s.lower() for s in self.market_skills.get("emerging", [])}
+        market_all = market_high | market_emerging
+
+        missing_skills = sorted(market_all - user_all)
+        high_priority_missing = sorted(market_high - user_all)
+        emerging_missing = sorted(market_emerging - user_all)
+
+        coverage = (
+            round(len(user_all & market_high) / len(market_high) * 100, 1)
+            if market_high
+            else 0.0
+        )
+
+        return {
+            "missing_skills": missing_skills,
+            "high_priority_skills": high_priority_missing,
+            "emerging_missing_skills": emerging_missing,
+            "user_has_high_demand_count": len(user_all & market_high),
+            "total_high_demand": len(market_high),
+            "coverage_percentage": coverage,
+        }
+
+
+def detect_skill_gaps(extracted_skills: Dict) -> Dict:
+    """
+    Detect skill gaps.
+
+    Args:
+        extracted_skills: {"technical": [...], "soft": [...]}
+
+    Returns:
+        Gap analysis dictionary
+    """
+    detector = GapDetector()
+    gaps = detector.detect_gaps(extracted_skills)
+    logger.info(
+        f"Gap analysis: {len(gaps['missing_skills'])} missing, "
+        f"{gaps['coverage_percentage']}% high-demand coverage"
+    )
+    return gaps
+
+
+parser.py:
+"""
+Text extraction module for PDF and DOCX files.
+
+Handles parsing of resume files and extracting clean text.
+Fix: clean_text() now preserves newlines so section detection works correctly.
+"""
+
+import re
+import logging
+import tempfile
+import os
+from typing import Optional
+from pathlib import Path
+
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None
+
+try:
+    from docx import Document
+except ImportError:
+    Document = None
+
+logger = logging.getLogger(__name__)
+
+MAX_TEXT_LENGTH = 50_000  # safety cap: ~50k chars is more than any real CV
+
+
+def extract_text_from_pdf(file_path: str) -> Optional[str]:
+    """
+    Extract text from a PDF file using pdfplumber.
+
+    Args:
+        file_path: Path to the PDF file
+
+    Returns:
+        Extracted and cleaned text, or None if extraction fails
+
+    Raises:
+        FileNotFoundError: If file does not exist
+        ValueError: If pdfplumber is not installed
+    """
+    if pdfplumber is None:
+        raise ValueError(
+            "pdfplumber is not installed. Run: pip install pdfplumber"
+        )
+
+    file_path = Path(file_path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"PDF file not found: {file_path}")
+
+    try:
+        pages_text = []
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    pages_text.append(page_text)
+
+        extracted_text = "\n\n".join(pages_text)
+        cleaned = clean_text(extracted_text)
+        logger.info(f"Extracted text from PDF: {file_path} ({len(cleaned)} chars)")
+        return cleaned[:MAX_TEXT_LENGTH]
+
+    except Exception as e:
+        logger.error(f"Error extracting text from PDF {file_path}: {e}")
+        raise
+
+
+def extract_text_from_docx(file_path: str) -> Optional[str]:
+    """
+    Extract text from a DOCX file using python-docx.
+
+    Args:
+        file_path: Path to the DOCX file
+
+    Returns:
+        Extracted and cleaned text, or None if extraction fails
+
+    Raises:
+        FileNotFoundError: If file does not exist
+        ValueError: If python-docx is not installed
+    """
+    if Document is None:
+        raise ValueError(
+            "python-docx is not installed. Run: pip install python-docx"
+        )
+
+    file_path = Path(file_path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"DOCX file not found: {file_path}")
+
+    try:
+        doc = Document(file_path)
+        lines = []
+
+        for para in doc.paragraphs:
+            if para.text.strip():
+                lines.append(para.text.strip())
+
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    if cell.text.strip():
+                        lines.append(cell.text.strip())
+
+        extracted_text = "\n".join(lines)
+        cleaned = clean_text(extracted_text)
+        logger.info(f"Extracted text from DOCX: {file_path} ({len(cleaned)} chars)")
+        return cleaned[:MAX_TEXT_LENGTH]
+
+    except Exception as e:
+        logger.error(f"Error extracting text from DOCX {file_path}: {e}")
+        raise
+
+
+def extract_text_from_bytes(file_bytes: bytes, filename: str) -> Optional[str]:
+    """
+    Extract text directly from file bytes (safe temp-file approach).
+
+    Uses a proper temp file with guaranteed cleanup via context manager.
+
+    Args:
+        file_bytes: Raw bytes of the uploaded file
+        filename: Original filename (used to detect extension)
+
+    Returns:
+        Extracted text string
+    """
+    ext = Path(filename).suffix.lower()
+    suffix = ext if ext in (".pdf", ".docx") else ".tmp"
+
+    # NamedTemporaryFile with delete=False so we control deletion
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    try:
+        tmp.write(file_bytes)
+        tmp.flush()
+        tmp.close()
+
+        if suffix == ".pdf":
+            return extract_text_from_pdf(tmp.name)
+        elif suffix == ".docx":
+            return extract_text_from_docx(tmp.name)
+        else:
+            raise ValueError(f"Unsupported file type: {filename}")
+
+    finally:
+        # Always clean up, even if extraction raises
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+def clean_text(text: str) -> str:
+    """
+    Clean and normalize extracted text.
+
+    Fix: preserves single newlines so section headers can be found by
+    extract_sections(). Previously collapsed ALL whitespace to a single
+    space, which destroyed section structure.
+
+    Args:
+        text: Raw extracted text
+
+    Returns:
+        Cleaned text with preserved line breaks
+    """
+    # Remove Windows-style line endings
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Remove control characters (keep \n = 0x0A, \t = 0x09)
+    text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", text)
+
+    # Collapse runs of spaces/tabs on the same line (but NOT newlines)
+    text = re.sub(r"[ \t]+", " ", text)
+
+    # Collapse more than 2 consecutive newlines to 2
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    # Strip leading/trailing whitespace per line
+    lines = [line.strip() for line in text.splitlines()]
+    text = "\n".join(lines)
+
+    return text.strip()
+
+
+def extract_sections(text: str) -> dict:
+    """
+    Extract common resume sections.
+
+    Args:
+        text: Full CV text (must retain newlines — use clean_text output)
+
+    Returns:
+        Dictionary with extracted sections
+    """
+    sections = {
+        "summary": "",
+        "experience": "",
+        "education": "",
+        "skills": "",
+        "projects": "",
+        "certifications": "",
+        "full_text": text,
+    }
+
+    section_keywords = {
+        "summary": ["summary", "objective", "profile", "about"],
+        "experience": ["experience", "employment", "work history", "work experience"],
+        "education": ["education", "academic background", "qualifications"],
+        "skills": ["skills", "technical skills", "competencies", "technologies"],
+        "projects": ["projects", "portfolio", "personal projects"],
+        "certifications": ["certifications", "certificates", "awards", "achievements"],
+    }
+
+    all_keywords = [kw for kws in section_keywords.values() for kw in kws]
+    boundary = "|".join(re.escape(k) for k in all_keywords)
+    boundary_pattern = rf"(?:^|\n)(?:{boundary})\s*[:\-]?\s*(?:\n|$)"
+
+    for section_name, keywords in section_keywords.items():
+        for keyword in keywords:
+            start_pattern = rf"(?:^|\n){re.escape(keyword)}\s*[:\-]?\s*(?:\n|$)"
+            match = re.search(start_pattern, text, re.IGNORECASE)
+            if match:
+                start = match.end()
+                # Find where next section starts
+                next_match = re.search(boundary_pattern, text[start:], re.IGNORECASE)
+                end = start + next_match.start() if next_match else len(text)
+                sections[section_name] = text[start:end].strip()
+                break
+
+    return sections
+
+
+def get_text_statistics(text: str) -> dict:
+    """
+    Calculate statistics about the text.
+
+    Args:
+        text: Input text
+
+    Returns:
+        Dictionary with statistics
+    """
+    words = text.split()
+    sentences = re.split(r"[.!?]+", text)
+
+    return {
+        "word_count": len(words),
+        "character_count": len(text),
+        "sentence_count": len([s for s in sentences if s.strip()]),
+        "average_word_length": round(len(text) / len(words), 2) if words else 0,
+    }
+
+
+scorer.py:
+"""
+CV Quality Scoring Engine.
+
+FIX (Issue #2 — SRS CV-FR-02 weight compliance):
+  SRS Table 4 defines 4 weighted scoring dimensions:
+    keywords (30%), completeness (25%), skill density (25%), formatting (20%)
+
+  The previous version used 6 independent components whose sub-scores did NOT
+  map onto those 4 SRS buckets, causing a discrepancy between what the SRS
+  specifies and what was being computed.
+
+  This version explicitly computes the 4 SRS-defined dimensions, each built
+  from the relevant sub-components below, so both the weights AND the dimension
+  names match the SRS exactly:
+
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  SRS Dimension   Weight   Sub-components (internal)             │
+    ├─────────────────────────────────────────────────────────────────┤
+    │  keywords         0.30    action verbs + keyword density        │
+    │  completeness     0.25    section headers + contact + education │
+    │  skill_density    0.25    technical skills + soft skills        │
+    │  formatting       0.20    structure + bullets + links           │
+    └─────────────────────────────────────────────────────────────────┘
+
+  The finer-grained sub-scores (experience_score, education_score, etc.) are
+  STILL returned in the breakdown dict for the UI to display — they are now
+  clearly labelled as "UI detail only" and do NOT affect the weighted total.
+  The weighted total is computed solely from the 4 SRS dimensions.
+
+FIX (Issue #5 — NullHandler):
+  Added logging.NullHandler() so the module is safe under Django.
+"""
+
+import re
+import logging
+from typing import Dict
+from analyzer.parser import get_text_statistics
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())  # Safe for library / Django use
+
+# ---------------------------------------------------------------------------
+# SRS-compliant scoring weights  (must sum to 1.0  — SRS Table 4 / CV-FR-02)
+# ---------------------------------------------------------------------------
+SRS_WEIGHTS = {
+    "keywords":     0.30,   # SRS: keyword relevance dimension
+    "completeness": 0.25,   # SRS: section completeness dimension
+    "skill_density":0.25,   # SRS: skill density dimension
+    "formatting":   0.20,   # SRS: formatting assessment dimension
+}
+
+assert abs(sum(SRS_WEIGHTS.values()) - 1.0) < 1e-9, "SRS weights must sum to 1.0"
+
+
+class CVScorer:
+    """
+    Score CV quality across the four SRS-defined dimensions (CV-FR-02).
+
+    Each dimension is scored 0–100 internally, then multiplied by its SRS
+    weight to produce the weighted 0–100 total.
+    """
+
+    def score(self, text: str, extracted_skills: Dict) -> Dict:
+        """
+        Calculate comprehensive CV score (0–100).
+
+        Args:
+            text: Full CV text
+            extracted_skills: {"technical": [...], "soft": [...]}
+
+        Returns:
+            {"score": float, "breakdown": {...}}
+            where breakdown contains:
+              - The 4 SRS dimension scores  (drive the weighted total)
+              - Additional UI detail scores  (for display only, not weighted)
+              - Text statistics
+        """
+        # ── 4 SRS-defined dimension scores (each 0–100) ─────────────────────
+        dim_keywords     = self._dim_keywords(text)
+        dim_completeness = self._dim_completeness(text)
+        dim_skill_density= self._dim_skill_density(extracted_skills)
+        dim_formatting   = self._dim_formatting(text)
+
+        # ── Weighted total per SRS Table 4 formula ───────────────────────────
+        total = (
+            dim_keywords      * SRS_WEIGHTS["keywords"]
+            + dim_completeness  * SRS_WEIGHTS["completeness"]
+            + dim_skill_density * SRS_WEIGHTS["skill_density"]
+            + dim_formatting    * SRS_WEIGHTS["formatting"]
+        )
+
+        # ── Extra UI detail sub-scores (NOT used in weighted total) ──────────
+        ui_experience   = self._ui_experience(text)
+        ui_education    = self._ui_education(text)
+        ui_projects     = self._ui_projects(text)
+
+        stats = get_text_statistics(text)
+
+        breakdown = {
+            # --- SRS-defined dimension scores (drive the total) ---
+            "keywords_score":      round(dim_keywords,      1),
+            "completeness_score":  round(dim_completeness,  1),
+            "skill_density_score": round(dim_skill_density, 1),
+            "formatting_score":    round(dim_formatting,    1),
+
+            # --- UI detail scores (display only, not weighted) ---
+            # Kept for backward-compat with suggestions.py and app.py
+            "skills_relevance_score": round(dim_skill_density, 1),  # alias
+            "experience_score":       round(ui_experience,  1),
+            "education_score":        round(ui_education,   1),
+            "keyword_density_score":  round(dim_keywords,   1),      # alias
+            "projects_score":         round(ui_projects,    1),
+
+            # --- Text statistics ---
+            "word_count":      stats["word_count"],
+            "character_count": stats["character_count"],
+            "sentence_count":  stats["sentence_count"],
+        }
+
+        return {"score": round(total, 1), "breakdown": breakdown}
+
+    # =========================================================================
+    # SRS Dimension 1 — Keywords (30%)
+    # Measures ATS-friendliness: action verbs, quantified results, keyword density
+    # =========================================================================
+
+    def _dim_keywords(self, text: str) -> float:
+        """
+        SRS Dimension: Keyword Relevance (0–100).
+
+        Evaluates action verbs, quantified achievements, and word-count sweet-spot.
+        """
+        words = text.split()
+        if not words:
+            return 0.0
+
+        score = 0.0
+
+        # Word count sweet spot (300–1000 words is ATS-optimal)
+        if 300 <= len(words) <= 1000:
+            score += 30
+        elif 150 <= len(words) < 300 or 1000 < len(words) <= 2000:
+            score += 15
+
+        # Action verbs (+5 each, capped at 40)
+        action_verbs = [
+            "led", "managed", "developed", "implemented", "created", "designed",
+            "improved", "achieved", "increased", "reduced", "built", "launched",
+            "delivered", "optimized", "collaborated", "mentored",
+        ]
+        verb_hits = sum(1 for v in action_verbs if re.search(rf"\b{v}\b", text, re.I))
+        score += min(verb_hits * 5, 40)
+
+        # Quantified results (+5 each, capped at 30)
+        quantified = re.findall(
+            r"\b\d+\%|\$\d+|\d+[xX]|\d+\s*(?:days|weeks|months|years|hours|users|clients)\b",
+            text, re.I,
+        )
+        score += min(len(quantified) * 5, 30)
+
+        return min(score, 100.0)
+
+    # =========================================================================
+    # SRS Dimension 2 — Completeness (25%)
+    # Measures section coverage + contact information presence
+    # =========================================================================
+
+    def _dim_completeness(self, text: str) -> float:
+        """
+        SRS Dimension: Section Completeness (0–100).
+
+        Checks for the standard CV sections required by ATS and recruiters.
+        """
+        score = 0.0
+
+        # Required sections (12 pts each, 5 sections = 60 pts max)
+        sections = {
+            "experience":     r"\b(experience|employment|work history|work experience)\b",
+            "education":      r"\b(education|academic|university|college|degree)\b",
+            "skills":         r"\b(skills?|competencies|technical skills)\b",
+            "summary":        r"\b(summary|objective|profile|about)\b",
+            "projects":       r"\b(projects?|portfolio)\b",
+        }
+        for label, pattern in sections.items():
+            if re.search(pattern, text, re.I):
+                score += 12
+
+        # Contact completeness (40 pts total)
+        if re.search(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", text):
+            score += 15  # email
+        if re.search(r"(\+?\d[\d\s\-().]{7,}\d)", text):
+            score += 10  # phone
+        if re.search(r"(linkedin\.com|github\.com|portfolio|https?://)", text, re.I):
+            score += 15  # online presence
+
+        return min(score, 100.0)
+
+    # =========================================================================
+    # SRS Dimension 3 — Skill Density (25%)
+    # Measures how many and how varied the skills are
+    # =========================================================================
+
+    def _dim_skill_density(self, extracted_skills: Dict) -> float:
+        """
+        SRS Dimension: Skill Density (0–100).
+
+        Technical skills: each worth 6 pts, capped at 60.
+        Soft skills:      each worth 8 pts, capped at 40.
+        """
+        tech_count = len(extracted_skills.get("technical", []))
+        soft_count = len(extracted_skills.get("soft", []))
+
+        tech_score = min(tech_count * 6, 60)
+        soft_score = min(soft_count * 8, 40)
+
+        return tech_score + soft_score
+
+    # =========================================================================
+    # SRS Dimension 4 — Formatting (20%)
+    # Measures visual structure, readability, and ATS-parse-friendliness
+    # =========================================================================
+
+    def _dim_formatting(self, text: str) -> float:
+        """
+        SRS Dimension: Formatting Assessment (0–100).
+        """
+        score = 0.0
+
+        if "\n" in text:
+            score += 20     # multi-line content (not a one-block blob)
+
+        if "•" in text or re.search(r"\n\s*[-*]\s", text):
+            score += 25     # bullet points present
+
+        if re.search(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", text):
+            score += 20     # email visible
+
+        if re.search(r"(\+?\d[\d\s\-().]{7,}\d)", text):
+            score += 15     # phone visible
+
+        if re.search(r"(https?://|github\.com|linkedin\.com|portfolio)", text, re.I):
+            score += 20     # online presence / links
+
+        return min(score, 100.0)
+
+    # =========================================================================
+    # UI Detail Sub-scores  (NOT used in SRS weighted total — display only)
+    # =========================================================================
+
+    def _ui_experience(self, text: str) -> float:
+        """Experience sub-score for UI display (not SRS-weighted)."""
+        score = 0.0
+        if re.search(r"\b(experience|employment|work history|work experience)\b", text, re.I):
+            score += 40
+        date_ranges = re.findall(
+            r"\d{4}\s*[-–]\s*(?:\d{4}|present|current|now)", text, re.I
+        )
+        score += min(len(date_ranges) * 15, 45)
+        quantified = re.findall(r"\b\d+\s*[%$]|\$\s*\d+|\d+[xX]\b", text)
+        score += min(len(quantified) * 5, 15)
+        return min(score, 100.0)
+
+    def _ui_education(self, text: str) -> float:
+        """Education sub-score for UI display (not SRS-weighted)."""
+        score = 0.0
+        if re.search(r"\b(education|academic|university|college|degree)\b", text, re.I):
+            score += 30
+        degrees = ["bachelor", "master", "phd", "diploma", "associate",
+                   r"b\.sc", r"m\.sc", "bs", "ms"]
+        for deg in degrees:
+            if re.search(rf"\b{deg}\b", text, re.I):
+                score += 15
+                break
+        if re.search(r"\bgpa\b.*?[\d.]+", text, re.I):
+            score += 10
+        if re.search(r"\b(20\d{2}|19\d{2})\b", text):
+            score += 10
+        fields = ["computer science", "software engineering", "information technology",
+                  "data science", "electrical", "mathematics"]
+        for field in fields:
+            if field in text.lower():
+                score += 15
+                break
+        return min(score, 100.0)
+
+    def _ui_projects(self, text: str) -> float:
+        """Projects sub-score for UI display (not SRS-weighted)."""
+        if re.search(r"\b(projects?|portfolio|personal projects?)\b", text, re.I):
+            return 100.0
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Public function
+# ---------------------------------------------------------------------------
+
+def calculate_score(text: str, extracted_skills: Dict) -> Dict:
+    """
+    Calculate CV quality score using the 4 SRS-defined weighted dimensions.
+
+    Args:
+        text: CV text
+        extracted_skills: {"technical": [...], "soft": [...]}
+
+    Returns:
+        {"score": float, "breakdown": {...}}
+    """
+    scorer = CVScorer()
+    result = scorer.score(text, extracted_skills)
+    logger.info(
+        f"CV scored: {result['score']}/100 "
+        f"(SRS weights — keywords:{SRS_WEIGHTS['keywords']}, "
+        f"completeness:{SRS_WEIGHTS['completeness']}, "
+        f"skill_density:{SRS_WEIGHTS['skill_density']}, "
+        f"formatting:{SRS_WEIGHTS['formatting']})"
+    )
+    return result
+
+
+similarity.py:
+"""
+Semantic Similarity Analysis Module.
+
+FIX (Issue #9 — import re placed after class that uses it):
+  'import re' was placed at the bottom of the file with a comment saying it was
+  intentional. The _chunk() static method called re.split() — this worked in
+  CPython only because the import executed before the method was ever called,
+  but it is non-standard and breaks static analysis / linters. Moved import re
+  to the top of the file where it belongs.
+
+FIX (Issue #5 — NullHandler):
+  Added logging.NullHandler() for Django logging safety.
+
+Other fixes retained from previous version:
+  - sentence-transformers missing from requirements handled gracefully
+  - Public function accepts optional job_description (SRS requirement)
+  - Uses built-in sample JD when none provided
+"""
+
+import re  # ← FIXED: was at bottom of file; moved to top
+import logging
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())  # Safe for library / Django use
+
+try:
+    from sentence_transformers import SentenceTransformer
+    from sklearn.metrics.pairwise import cosine_similarity
+    import numpy as np
+
+    _ST_AVAILABLE = True
+except ImportError:
+    SentenceTransformer = None  # type: ignore
+    cosine_similarity = None   # type: ignore
+    np = None                  # type: ignore
+    _ST_AVAILABLE = False
+    logger.warning(
+        "sentence-transformers or scikit-learn not installed. "
+        "Similarity scoring will be unavailable. "
+        "Run: pip install sentence-transformers scikit-learn"
+    )
+
+SAMPLE_JOB_DESCRIPTION = """
+We are looking for a skilled software professional with:
+- Strong technical background and programming skills (Python, JavaScript, Java)
+- Experience with modern web frameworks (Django, React, Node.js)
+- Database knowledge: SQL, PostgreSQL, MongoDB
+- Cloud and DevOps: AWS, Docker, Kubernetes, CI/CD
+- Problem-solving and analytical abilities
+- Team collaboration and communication skills
+- Degree in Computer Science, Software Engineering, or related field
+- Portfolio, GitHub profile, or open-source contributions
+- Understanding of software architecture and design patterns
+- Version control with Git
+"""
+
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+# Maximum characters accepted from a user-supplied job description
+MAX_JD_LENGTH = 5_000
+
+
+class SimilarityAnalyzer:
+    """Analyze semantic similarity between a CV and a job description."""
+
+    def __init__(self):
+        self.model = self._load_model()
+
+    def _load_model(self):
+        if not _ST_AVAILABLE:
+            return None
+        try:
+            model = SentenceTransformer(MODEL_NAME)
+            logger.info(f"Loaded sentence-transformers model: {MODEL_NAME}")
+            return model
+        except Exception as e:
+            logger.error(f"Error loading sentence-transformers model: {e}")
+            return None
+
+    @property
+    def model_available(self) -> bool:
+        return self.model is not None
+
+    def calculate_similarity(
+        self, cv_text: str, job_description: Optional[str] = None
+    ) -> float:
+        """
+        Calculate semantic similarity between CV and job description.
+
+        Args:
+            cv_text: Full CV text
+            job_description: Job description text. Falls back to sample if None.
+
+        Returns:
+            Similarity percentage (0.0–100.0), or 0 if model unavailable.
+        """
+        # Guard: empty CV text → return 0 immediately (not ~50%)
+        if not cv_text or not cv_text.strip():
+            return 0.0
+
+        if self.model is None:
+            logger.warning("Similarity model not available — returning 0.")
+            return 0.0
+
+        # Sanitise and cap job description length
+        if job_description and job_description.strip():
+            jd = job_description.strip()[:MAX_JD_LENGTH]
+        else:
+            jd = SAMPLE_JOB_DESCRIPTION
+
+        try:
+            cv_chunks = self._chunk(cv_text, max_len=256)
+            jd_chunks = self._chunk(jd, max_len=256)
+
+            if not cv_chunks or not jd_chunks:
+                return 0.0
+
+            cv_emb = self.model.encode(cv_chunks, show_progress_bar=False)
+            jd_emb = self.model.encode(jd_chunks, show_progress_bar=False)
+
+            sim_matrix = cosine_similarity(cv_emb, jd_emb)
+            avg_sim = float(np.mean(np.max(sim_matrix, axis=1)))
+            pct = round(avg_sim * 100, 1)
+
+            logger.info(f"Similarity score: {pct}%")
+            return pct
+
+        except Exception as e:
+            logger.error(f"Similarity calculation failed: {e}")
+            return 0.0
+
+    @staticmethod
+    def _chunk(text: str, max_len: int = 256) -> list:
+        """
+        Split text into sentence chunks within max_len characters.
+
+        Uses re (imported at top of file) to split on sentence boundaries.
+        """
+        if not text or not text.strip():
+            return []
+
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        chunks, current = [], ""
+        for sent in sentences:
+            if len(current) + len(sent) < max_len:
+                current += sent + " "
+            else:
+                if current.strip():
+                    chunks.append(current.strip())
+                current = sent + " "
+        if current.strip():
+            chunks.append(current.strip())
+
+        return chunks if chunks else [text[:max_len]]
+
+
+def calculate_similarity(
+    cv_text: str, job_description: Optional[str] = None
+) -> float:
+    """
+    Calculate semantic similarity between CV and job description.
+
+    Args:
+        cv_text: Full CV text
+        job_description: Optional job description. Uses built-in sample if None.
+
+    Returns:
+        Similarity percentage (0.0–100.0)
+    """
+    analyzer = SimilarityAnalyzer()
+    return analyzer.calculate_similarity(cv_text, job_description)
+
+
+def is_similarity_available() -> bool:
+    """Check whether the similarity model is installed and loadable."""
+    return _ST_AVAILABLE
+
+skills.py:
+"""
+Skill extraction module.
+
+Strategy (SRS CV-FR-01: spaCy NLP + Hugging Face Transformers + keyword matching):
+  1. Keyword matching against skills_db.json      — fast, high precision
+  2. spaCy NER (if installed)                     — catches skills not in the DB
+  3. Hugging Face Transformer NER pipeline        — SRS-required second ML pass
+     (dslim/bert-base-NER, falls back gracefully if not available)
+  4. Results are merged and deduplicated
+
+FIX (Issue #1 — SRS CV-FR-01 compliance):
+  Previous version was missing the Hugging Face Transformer extraction pass
+  entirely. SRS Table 3 explicitly requires "spaCy AND Hugging Face Transformer
+  models" for NLP-based skill extraction. Added _load_hf_ner() and _hf_extract()
+  using dslim/bert-base-NER. Falls back gracefully when transformers/torch
+  is not installed and logs a clear warning.
+
+FIX (Issue #5 — NullHandler):
+  Added logging.NullHandler() so this module is safe to import under Django
+  without producing 'No handlers could be found' warnings.
+"""
+
+import json
+import logging
+import re
+from pathlib import Path
+from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())  # Safe for library / Django use
+
+# ---------------------------------------------------------------------------
+# Optional spaCy import
+# ---------------------------------------------------------------------------
+try:
+    import spacy
+    _SPACY_AVAILABLE = True
+except ImportError:
+    spacy = None  # type: ignore
+    _SPACY_AVAILABLE = False
+    logger.warning(
+        "spaCy not installed. Falling back to keyword-only extraction. "
+        "Run: pip install spacy && python -m spacy download en_core_web_sm"
+    )
+
+# ---------------------------------------------------------------------------
+# Optional Hugging Face Transformers import  (SRS CV-FR-01 requirement)
+# ---------------------------------------------------------------------------
+try:
+    from transformers import pipeline as hf_pipeline
+    _HF_AVAILABLE = True
+except ImportError:
+    hf_pipeline = None  # type: ignore
+    _HF_AVAILABLE = False
+    logger.warning(
+        "Hugging Face transformers not installed — SRS CV-FR-01 requires it. "
+        "Run: pip install transformers torch"
+    )
+
+# Default skill DB path — resolved relative to this file
+_DEFAULT_SKILL_DB = Path(__file__).parent.parent / "models" / "skill_db.json"
+
+# HF model: lightweight BERT fine-tuned on CoNLL-2003 NER
+# Recognises PER, ORG, LOC, MISC — ORG and MISC capture most tech names in CVs
+_HF_NER_MODEL = "dslim/bert-base-NER"
+_HF_TECH_LABELS = {"ORG", "MISC"}   # entity_group values after aggregation
+
+# Heuristic pattern — tokens that look like technology / tool names:
+#   CamelCase (Vue.js), ALL-CAPS short (AWS, CSS), mixed alphanumeric (Node.js)
+_TECH_TOKEN_RE = re.compile(
+    r"^(?:[A-Z][a-zA-Z0-9.#+\-/]{1,}|[A-Z]{2,10}|[a-z]+[0-9]+[a-zA-Z0-9]*)$"
+)
+
+
+class SkillExtractor:
+    """
+    Extract skills from CV text using three complementary strategies:
+      1. Keyword matching   — high precision, database-driven, always runs
+      2. spaCy NER          — catches technology names not in the skill DB
+      3. HF BERT NER        — SRS CV-FR-01 Transformer pass
+    """
+
+    def __init__(self, skill_db_path: Optional[str] = None):
+        self.skill_db = self._load_skill_db(skill_db_path)
+        self._nlp = self._load_spacy()
+        self._hf_ner = self._load_hf_ner()
+
+    # ------------------------------------------------------------------
+    # Loaders
+    # ------------------------------------------------------------------
+
+    def _load_skill_db(self, skill_db_path: Optional[str]) -> dict:
+        path = Path(skill_db_path) if skill_db_path else _DEFAULT_SKILL_DB
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                db = json.load(f)
+            logger.info(f"Loaded skill database from {path}")
+            # Deduplicate lists (fixes duplicate entries in original JSON)
+            db["technical"] = list(dict.fromkeys(db.get("technical", [])))
+            db["soft"] = list(dict.fromkeys(db.get("soft", [])))
+            return db
+        except FileNotFoundError:
+            logger.warning(f"Skill database not found at {path}")
+            return {"technical": [], "soft": []}
+        except json.JSONDecodeError:
+            logger.warning(f"Invalid JSON in skill database at {path}")
+            return {"technical": [], "soft": []}
+
+    def _load_spacy(self):
+        """Load spaCy model if available."""
+        if not _SPACY_AVAILABLE:
+            return None
+        try:
+            nlp = spacy.load("en_core_web_sm")
+            logger.info("Loaded spaCy model: en_core_web_sm")
+            return nlp
+        except OSError:
+            logger.warning(
+                "spaCy model 'en_core_web_sm' not found. "
+                "Run: python -m spacy download en_core_web_sm"
+            )
+            return None
+
+    def _load_hf_ner(self):
+        """
+        Load Hugging Face NER pipeline (SRS CV-FR-01 requirement).
+
+        Uses dslim/bert-base-NER — a BERT model fine-tuned on CoNLL-2003 that
+        reliably detects ORG and MISC entities, which in CV text correspond
+        to companies, tools, frameworks, and technology names.
+
+        aggregation_strategy="simple" merges sub-word tokens (##suffix pieces)
+        into whole words before returning entity spans.
+
+        Falls back gracefully if transformers / torch is not installed.
+        """
+        if not _HF_AVAILABLE:
+            return None
+        try:
+            ner = hf_pipeline(
+                "ner",
+                model=_HF_NER_MODEL,
+                aggregation_strategy="simple",  # merges ##sub-word tokens
+                device=-1,                       # CPU-only; safe default
+            )
+            logger.info(f"Loaded Hugging Face NER model: {_HF_NER_MODEL}")
+            return ner
+        except Exception as e:
+            logger.error(
+                f"Failed to load Hugging Face NER model '{_HF_NER_MODEL}': {e}. "
+                "Extraction will proceed without the Transformer pass."
+            )
+            return None
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def extract(self, text: str) -> Dict[str, List[str]]:
+        """
+        Extract skills from text using all available strategies.
+
+        Args:
+            text: CV full text
+
+        Returns:
+            {"technical": [...], "soft": [...]}
+        """
+        technical: set = set()
+        soft: set = set()
+
+        try:
+            # Step 1: keyword matching (high precision, always runs)
+            technical.update(self._keyword_match(text, self.skill_db.get("technical", [])))
+            soft.update(self._keyword_match(text, self.skill_db.get("soft", [])))
+
+            # Step 2: spaCy NER augmentation
+            if self._nlp is not None:
+                ner_technical, ner_soft = self._spacy_extract(text)
+                technical.update(ner_technical)
+                soft.update(ner_soft)
+
+            # Step 3: Hugging Face BERT NER (SRS CV-FR-01)
+            if self._hf_ner is not None:
+                hf_technical = self._hf_extract(text)
+                technical.update(hf_technical)
+
+        except Exception as e:
+            logger.error(f"Error during skill extraction: {e}")
+
+        return {
+            "technical": sorted(technical),
+            "soft": sorted(soft),
+        }
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _keyword_match(self, text: str, keywords: List[str]) -> set:
+        """Word-boundary keyword matching (case-insensitive)."""
+        matched: set = set()
+        text_lower = text.lower()
+        for keyword in keywords:
+            try:
+                pattern = rf"\b{re.escape(keyword.lower())}\b"
+                if re.search(pattern, text_lower):
+                    matched.add(keyword)
+            except Exception as e:
+                logger.debug(f"Keyword match error for '{keyword}': {e}")
+        return matched
+
+    def _spacy_extract(self, text: str):
+        """
+        Use spaCy to find additional skill-like entities not in the DB.
+        Only processes first 10k chars to keep inference fast.
+        """
+        doc = self._nlp(text[:10_000])
+
+        known_technical = {s.lower() for s in self.skill_db.get("technical", [])}
+        known_soft = {s.lower() for s in self.skill_db.get("soft", [])}
+
+        extra_technical: set = set()
+        extra_soft: set = set()
+
+        for ent in doc.ents:
+            token = ent.text.strip()
+            token_lower = token.lower()
+
+            if len(token) < 2 or len(token) > 40:
+                continue
+
+            if ent.label_ in ("ORG", "PRODUCT"):
+                if token_lower not in known_technical and token_lower not in known_soft:
+                    if _TECH_TOKEN_RE.match(token) or token.isupper():
+                        extra_technical.add(token)
+
+        return extra_technical, extra_soft
+
+    def _hf_extract(self, text: str) -> set:
+        """
+        Hugging Face BERT NER extraction pass (SRS CV-FR-01).
+
+        Runs dslim/bert-base-NER on the first ~600 words of the CV
+        (approximates the 512-token BERT limit). Filters entity spans whose
+        aggregated label is ORG or MISC and whose surface form matches the
+        technology-name heuristic (_TECH_TOKEN_RE).
+
+        Sub-word artefacts (tokens starting with '##') are discarded.
+        Entities already captured by keyword matching are skipped to avoid
+        duplicates.
+
+        Returns:
+            set of additional technical skill strings
+        """
+        known_technical = {s.lower() for s in self.skill_db.get("technical", [])}
+        known_soft = {s.lower() for s in self.skill_db.get("soft", [])}
+        extra: set = set()
+
+        try:
+            # Slice to ~600 words ≈ 512 BERT tokens to stay within model limit
+            truncated = " ".join(text.split()[:600])
+            entities = self._hf_ner(truncated)
+
+            for ent in entities:
+                word = ent.get("word", "").strip()
+                label = ent.get("entity_group", "")
+
+                # Discard sub-word tokenisation artefacts
+                if word.startswith("##") or len(word) < 2 or len(word) > 40:
+                    continue
+
+                # Only ORG and MISC labels are relevant for technical skills
+                if label not in _HF_TECH_LABELS:
+                    continue
+
+                word_lower = word.lower()
+                # Skip anything already found by keyword matching
+                if word_lower in known_technical or word_lower in known_soft:
+                    continue
+
+                # Apply technology-name heuristic
+                if _TECH_TOKEN_RE.match(word) or word.isupper():
+                    extra.add(word)
+                    logger.debug(f"HF NER skill: '{word}' ({label})")
+
+        except Exception as e:
+            logger.error(f"Hugging Face NER extraction failed: {e}")
+
+        return extra
+
+
+# ---------------------------------------------------------------------------
+# Module-level availability flags (used by app.py sidebar status display)
+# ---------------------------------------------------------------------------
+
+def is_hf_available() -> bool:
+    """Return True if Hugging Face transformers is installed."""
+    return _HF_AVAILABLE
+
+
+# ---------------------------------------------------------------------------
+# Public module-level function
+# ---------------------------------------------------------------------------
+
+def extract_skills(text: str, skill_db_path: Optional[str] = None) -> Dict[str, List[str]]:
+    """
+    Extract skills from CV text using all available strategies.
+
+    Args:
+        text: CV text
+        skill_db_path: Optional path to skill database JSON
+
+    Returns:
+        {"technical": [...], "soft": [...]}
+    """
+    extractor = SkillExtractor(skill_db_path)
+    skills = extractor.extract(text)
+    logger.info(
+        f"Extracted {len(skills['technical'])} technical and "
+        f"{len(skills['soft'])} soft skills "
+        f"(spaCy={'on' if _SPACY_AVAILABLE else 'off'}, "
+        f"HF NER={'on' if _HF_AVAILABLE else 'off'})"
+    )
+    return skills
+
+suggerstions.py:
+"""
+Suggestion Generation Engine.
+
+FIX (Issue #10 — filename typo):
+  File was named 'suggerstions.py' (extra 'r'). app.py imports from
+  'analyzer.suggestions' which caused a ModuleNotFoundError. Renamed to
+  suggestions.py. This is the correct canonical file going forward.
+
+FIX (scorer.py key alignment after Issue #2 fix):
+  scorer.py now returns both SRS dimension keys AND backward-compat aliases:
+    - "keyword_density_score"  → alias for "keywords_score"
+    - "skills_relevance_score" → alias for "skill_density_score"
+    - "experience_score", "education_score", "projects_score" (UI detail scores)
+  All lookups here use the backward-compat alias keys so no changes are needed
+  to the suggestion logic itself.
+
+FIX (Issue #5 — NullHandler):
+  Added logging.NullHandler() for Django safety.
+"""
+
+import logging
+from typing import Dict, List
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())  # Safe for library / Django use
+
+
+class SuggestionGenerator:
+    """Generate actionable, prioritized CV improvement suggestions."""
+
+    def generate(
+        self, score_result: Dict, extracted_skills: Dict, gaps: Dict
+    ) -> List[Dict]:
+        suggestions = []
+        suggestions.extend(self._high_priority(score_result, extracted_skills, gaps))
+        suggestions.extend(self._medium_priority(score_result, extracted_skills, gaps))
+        suggestions.extend(self._low_priority(score_result, extracted_skills, gaps))
+        return suggestions
+
+    # ------------------------------------------------------------------
+    # Priority buckets
+    # ------------------------------------------------------------------
+
+    def _high_priority(self, score_result, extracted_skills, gaps) -> List[Dict]:
+        suggestions = []
+        bd = score_result.get("breakdown", {})
+        score = score_result.get("score", 0)
+
+        if score < 50:
+            suggestions.append({
+                "priority": "High",
+                "category": "Overall",
+                "message": (
+                    f"Your CV score is {score}/100 — below 50. Consider a comprehensive "
+                    "revision: add more skills, quantify achievements, and improve structure."
+                ),
+            })
+
+        if len(extracted_skills.get("technical", [])) < 3:
+            suggestions.append({
+                "priority": "High",
+                "category": "Skills",
+                "message": (
+                    "Fewer than 3 technical skills detected. Explicitly list programming "
+                    "languages, frameworks, tools, and databases in a dedicated Skills section."
+                ),
+            })
+
+        top_missing = gaps.get("high_priority_skills", [])[:3]
+        if top_missing:
+            suggestions.append({
+                "priority": "High",
+                "category": "Skill Gap",
+                "message": (
+                    f"High-demand skills missing from your CV: {', '.join(top_missing)}. "
+                    "Adding or learning these will significantly improve your market fit."
+                ),
+            })
+
+        if bd.get("formatting_score", 0) < 40:
+            suggestions.append({
+                "priority": "High",
+                "category": "Formatting",
+                "message": (
+                    "CV formatting needs improvement. Add clear section headers, bullet points, "
+                    "and ensure your email, phone, and LinkedIn are visible at the top."
+                ),
+            })
+
+        if bd.get("experience_score", 0) < 30:
+            suggestions.append({
+                "priority": "High",
+                "category": "Experience",
+                "message": (
+                    "Experience section is weak or missing. Include job titles, company names, "
+                    "date ranges (e.g. 2022–2024), and bullet-pointed achievements."
+                ),
+            })
+
+        return suggestions
+
+    def _medium_priority(self, score_result, extracted_skills, gaps) -> List[Dict]:
+        suggestions = []
+        bd = score_result.get("breakdown", {})
+        score = score_result.get("score", 0)
+
+        if 50 <= score < 75:
+            suggestions.append({
+                "priority": "Medium",
+                "category": "Overall",
+                "message": (
+                    "Good foundation — but there's room to grow. Add measurable results "
+                    "(e.g. 'reduced load time by 40%') to push your score above 75."
+                ),
+            })
+
+        if len(extracted_skills.get("soft", [])) < 2:
+            suggestions.append({
+                "priority": "Medium",
+                "category": "Soft Skills",
+                "message": (
+                    "Add soft skills (leadership, communication, teamwork, problem-solving). "
+                    "These are detected from your CV text — mention them naturally."
+                ),
+            })
+
+        # Uses backward-compat alias key set by scorer.py
+        if bd.get("keyword_density_score", 0) < 40:
+            suggestions.append({
+                "priority": "Medium",
+                "category": "Keywords",
+                "message": (
+                    "Low keyword density. Use strong action verbs (led, built, optimized) "
+                    "and include industry-specific terms to improve ATS ranking."
+                ),
+            })
+
+        if bd.get("education_score", 0) < 30:
+            suggestions.append({
+                "priority": "Medium",
+                "category": "Education",
+                "message": (
+                    "Enhance your education section: include degree name, institution, "
+                    "graduation year, and any relevant coursework or GPA."
+                ),
+            })
+
+        emerging = gaps.get("emerging_missing_skills", [])[:2]
+        if emerging:
+            suggestions.append({
+                "priority": "Medium",
+                "category": "Emerging Skills",
+                "message": (
+                    f"Consider picking up these emerging skills: {', '.join(emerging)}. "
+                    "They are gaining rapid market traction."
+                ),
+            })
+
+        return suggestions
+
+    def _low_priority(self, score_result, extracted_skills, gaps) -> List[Dict]:
+        suggestions = []
+        bd = score_result.get("breakdown", {})
+        score = score_result.get("score", 0)
+
+        if score >= 75:
+            suggestions.append({
+                "priority": "Low",
+                "category": "Polish",
+                "message": (
+                    "Great CV score! Fine-tune by adding portfolio links, GitHub profile, "
+                    "or open-source contributions to stand out further."
+                ),
+            })
+
+        if bd.get("projects_score", 0) == 0:
+            suggestions.append({
+                "priority": "Low",
+                "category": "Projects",
+                "message": (
+                    "No projects section detected. Add 2–3 personal or academic projects "
+                    "with the technologies used and measurable outcomes."
+                ),
+            })
+
+        if bd.get("word_count", 0) < 300:
+            suggestions.append({
+                "priority": "Low",
+                "category": "Content Length",
+                "message": (
+                    f"CV is short ({bd.get('word_count', 0)} words). "
+                    "Aim for 300–1000 words for better ATS coverage and recruiter impact."
+                ),
+            })
+
+        return suggestions
+
+
+def generate_suggestions(
+    score_result: Dict, extracted_skills: Dict, gaps: Dict
+) -> List[Dict]:
+    """
+    Generate improvement suggestions.
+
+    Args:
+        score_result: Output from calculate_score()
+        extracted_skills: Output from extract_skills()
+        gaps: Output from detect_skill_gaps()
+
+    Returns:
+        List of {"priority": str, "category": str, "message": str}
+    """
+    gen = SuggestionGenerator()
+    suggestions = gen.generate(score_result, extracted_skills, gaps)
+    logger.info(f"Generated {len(suggestions)} suggestions")
+    return suggestions
+
+utilites.py:
+"""
+Utility functions for CV analysis.
+
+FIX (Issue #5 — filename typo):
+  File was named 'utilites.py' (missing 't'). app.py imports from
+  'analyzer.utilities' which caused a ModuleNotFoundError. Renamed to
+  utilities.py. This is the correct canonical file going forward.
+
+Other fixes retained from previous version:
+  - calculate_experience_years() uses datetime.date.today().year (not hardcoded)
+  - get_file_size_mb() handles Streamlit UploadedFile objects correctly
+  - NullHandler added for Django logging safety
+"""
+
+import logging
+import re
+import datetime
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())  # Safe for library / Django use
+
+MAX_FILE_SIZE_MB = 5
+ALLOWED_EXTENSIONS = {"pdf", "docx"}
+
+
+def validate_file(filename: str, file_size_mb: float) -> tuple:
+    """
+    Validate an uploaded file.
+
+    Args:
+        filename: Name of the uploaded file
+        file_size_mb: Size in megabytes
+
+    Returns:
+        (is_valid: bool, error_message: str)
+    """
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+
+    if ext not in ALLOWED_EXTENSIONS:
+        msg = f"Unsupported file type '.{ext}'. Please upload a PDF or DOCX file."
+        logger.warning(msg)
+        return False, msg
+
+    if file_size_mb > MAX_FILE_SIZE_MB:
+        msg = (
+            f"File is too large ({file_size_mb:.2f} MB). "
+            f"Maximum allowed is {MAX_FILE_SIZE_MB} MB."
+        )
+        logger.warning(msg)
+        return False, msg
+
+    return True, ""
+
+
+def get_file_size_mb(file_object) -> float:
+    """
+    Get file size in megabytes from a Streamlit UploadedFile or file-like object.
+
+    Args:
+        file_object: Streamlit UploadedFile or any file-like object
+
+    Returns:
+        Size in MB
+    """
+    try:
+        if hasattr(file_object, "size") and file_object.size:
+            return file_object.size / (1024 * 1024)
+        if hasattr(file_object, "getbuffer"):
+            return len(file_object.getbuffer()) / (1024 * 1024)
+        if hasattr(file_object, "read"):
+            data = file_object.read()
+            file_object.seek(0)
+            return len(data) / (1024 * 1024)
+    except Exception as e:
+        logger.error(f"Could not determine file size: {e}")
+    return 0.0
+
+
+def normalize_skill_name(skill: str) -> str:
+    """Lowercase and strip a skill name for comparison."""
+    return skill.lower().strip()
+
+
+def calculate_experience_years(text: str) -> int:
+    """
+    Estimate total years of experience from date ranges in CV text.
+
+    Args:
+        text: CV text
+
+    Returns:
+        Estimated years of experience (0 if none detected)
+    """
+    current_year = datetime.date.today().year
+    pattern = r"(\d{4})\s*[-–]\s*(?:(\d{4})|(present|current|now))"
+    matches = re.findall(pattern, text, re.IGNORECASE)
+
+    total = 0
+    for start_str, end_str, present in matches:
+        try:
+            start = int(start_str)
+            end = current_year if present else int(end_str)
+            if 1970 <= start <= current_year and start <= end:
+                total += end - start
+        except ValueError:
+            continue
+
+    return max(total, 0)
+
+
+def extract_contact_info(text: str) -> dict:
+    """
+    Extract contact information from CV text.
+
+    Args:
+        text: CV text
+
+    Returns:
+        {"email", "phone", "linkedin", "github"} — None for missing fields
+    """
+    contact = {"email": None, "phone": None, "linkedin": None, "github": None}
+
+    email_m = re.search(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", text)
+    if email_m:
+        contact["email"] = email_m.group()
+
+    phone_m = re.search(r"(\+?\d[\d\s\-().]{7,}\d)", text)
+    if phone_m:
+        contact["phone"] = phone_m.group().strip()
+
+    linkedin_m = re.search(r"linkedin\.com/in/[a-zA-Z0-9\-]+", text, re.I)
+    if linkedin_m:
+        contact["linkedin"] = linkedin_m.group()
+
+    github_m = re.search(r"github\.com/[a-zA-Z0-9\-]+", text, re.I)
+    if github_m:
+        contact["github"] = github_m.group()
+
+    return contact
+
+
+def check_section_completeness(text: str) -> dict:
+    """
+    Check which standard CV sections are present.
+
+    Args:
+        text: CV text
+
+    Returns:
+        {"sections": {...}, "completed_count": int, "completeness_percentage": float}
+    """
+    sections = {
+        "contact": bool(re.search(r"(email|phone|linkedin|@)", text, re.I)),
+        "summary": bool(re.search(r"\b(summary|objective|profile|about)\b", text, re.I)),
+        "experience": bool(re.search(r"\b(experience|employment|work history)\b", text, re.I)),
+        "education": bool(re.search(r"\b(education|academic|university|college)\b", text, re.I)),
+        "skills": bool(re.search(r"\b(skills?|competencies|technical skills)\b", text, re.I)),
+        "projects": bool(re.search(r"\b(projects?|portfolio)\b", text, re.I)),
+        "certifications": bool(re.search(r"\b(certifications?|awards|licenses)\b", text, re.I)),
+    }
+
+    completed = sum(1 for v in sections.values() if v)
+    total = len(sections)
+
+    return {
+        "sections": sections,
+        "completed_count": completed,
+        "total_expected": total,
+        "completeness_percentage": round(completed / total * 100, 1),
+    }
+
+
+market_skills.json:
+{
+  "high_demand": [
+    "Python",
+    "JavaScript",
+    "React",
+    "AWS",
+    "Docker",
+    "Kubernetes",
+    "Machine Learning",
+    "Data Science",
+    "SQL",
+    "Java",
+    "TypeScript",
+    "Node.js",
+    "Django",
+    "REST API",
+    "Git",
+    "CI/CD",
+    "MongoDB",
+    "PostgreSQL",
+    "Cloud Computing",
+    "Azure",
+    "Google Cloud",
+    "FastAPI",
+    "GraphQL",
+    "Microservices",
+    "Linux",
+    "TensorFlow",
+    "PyTorch",
+    "Pandas",
+    "Communication",
+    "Leadership",
+    "Problem-solving",
+    "Teamwork",
+    "Critical Thinking"
+  ],
+  "emerging": [
+    "Rust",
+    "Go",
+    "Kotlin",
+    "Swift",
+    "WebAssembly",
+    "Blockchain",
+    "Web3",
+    "GPT/LLM",
+    "Generative AI",
+    "Vector Databases",
+    "Edge Computing",
+    "Quantum Computing",
+    "IoT",
+    "AR/VR",
+    "Low-code/No-code",
+    "RPA",
+    "DevOps",
+    "SRE",
+    "Cybersecurity",
+    "Zero Trust",
+    "Terraform",
+    "Ansible"
+  ]
+}
+
+skills_db.json:
+{
+  "technical": [
+    "Python",
+    "JavaScript",
+    "Java",
+    "C++",
+    "C#",
+    "Go",
+    "Rust",
+    "TypeScript",
+    "PHP",
+    "Ruby",
+    "Swift",
+    "Kotlin",
+    "React",
+    "Angular",
+    "Vue.js",
+    "Django",
+    "Flask",
+    "FastAPI",
+    "Node.js",
+    "Express.js",
+    "Spring Boot",
+    "ASP.NET",
+    "Laravel",
+    "MongoDB",
+    "PostgreSQL",
+    "MySQL",
+    "Redis",
+    "Elasticsearch",
+    "Docker",
+    "Kubernetes",
+    "AWS",
+    "Azure",
+    "Google Cloud",
+    "Git",
+    "GitLab",
+    "GitHub",
+    "CI/CD",
+    "Jenkins",
+    "GitLab CI",
+    "GitHub Actions",
+    "Linux",
+    "Windows Server",
+    "macOS",
+    "REST API",
+    "GraphQL",
+    "gRPC",
+    "Microservices",
+    "Message Queue",
+    "RabbitMQ",
+    "Kafka",
+    "Machine Learning",
+    "Deep Learning",
+    "TensorFlow",
+    "PyTorch",
+    "Scikit-learn",
+    "Pandas",
+    "NumPy",
+    "Data Science",
+    "Big Data",
+    "Apache Spark",
+    "Hadoop",
+    "SQL",
+    "NoSQL",
+    "Agile",
+    "Scrum",
+    "Kanban",
+    "JIRA",
+    "Confluence",
+    "HTML",
+    "CSS",
+    "SASS",
+    "Webpack",
+    "Terraform",
+    "Ansible",
+    "Docker Compose",
+    "SSL/TLS",
+    "OAuth",
+    "JWT",
+    "Web Security",
+    "OWASP",
+    "API Design",
+    "Database Design",
+    "System Design",
+    "Software Architecture",
+    "Design Patterns",
+    "Unit Testing",
+    "Integration Testing",
+    "End-to-End Testing",
+    "Jest",
+    "Pytest",
+    "Selenium",
+    "Postman",
+    "VS Code",
+    "IntelliJ",
+    "Visual Studio",
+    "Xcode",
+    "Vim"
+  ],
+  "soft": [
+    "Leadership",
+    "Communication",
+    "Teamwork",
+    "Problem-solving",
+    "Critical Thinking",
+    "Creativity",
+    "Adaptability",
+    "Time Management",
+    "Collaboration",
+    "Project Management",
+    "Decision Making",
+    "Negotiation",
+    "Presentation Skills",
+    "Public Speaking",
+    "Conflict Resolution",
+    "Emotional Intelligence",
+    "Mentoring",
+    "Coaching",
+    "Delegation",
+    "Accountability",
+    "Work Ethic",
+    "Reliability",
+    "Attention to Detail",
+    "Customer Service",
+    "Analysis",
+    "Multitasking",
+    "Flexibility",
+    "Initiative",
+    "Organization",
+    "Prioritization"
+  ]
+}
+
+app.py:
+"""
+AI CV Analyzer — Streamlit Application
+
+Changes from previous version:
+
+  Issue #1 (HF NER):
+    - Imported is_hf_available() from analyzer.skills
+    - Added HF NER status row in sidebar Module Status section
+
+  Issue #2 (scorer weights):
+    - Score breakdown table now shows the 4 SRS dimension scores as the primary
+      columns, with the UI detail scores shown in a secondary expander.
+
+  Issue #5 (filename typos):
+    - Import changed from 'analyzer.utilities' (was 'analyzer.utilites')
+    - Import changed from 'analyzer.suggestions' (was 'analyzer.suggerstions')
+    - Both files are now correctly named on disk.
+
+  Issue #9 (similarity re import):
+    - No change needed in app.py; fix is in similarity.py itself.
+"""
+
+import json
+import logging
+import sys
+from pathlib import Path
+
+import streamlit as st
+
+# Ensure project root is on sys.path (works from any working directory)
+_PROJECT_ROOT = Path(__file__).parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from analyzer.parser import extract_text_from_bytes
+from analyzer.skills import extract_skills, _SPACY_AVAILABLE, is_hf_available   # ← added is_hf_available
+from analyzer.scorer import calculate_score
+from analyzer.gap import detect_skill_gaps
+from analyzer.suggestions import generate_suggestions          # ← fixed: was suggerstions
+from analyzer.similarity import calculate_similarity, is_similarity_available
+from analyzer.utilities import validate_file, get_file_size_mb, check_section_completeness  # ← fixed: was utilites
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Page config
+# ---------------------------------------------------------------------------
+
+st.set_page_config(
+    page_title="AI CV Analyzer",
+    page_icon="📄",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ---------------------------------------------------------------------------
+# Session state
+# ---------------------------------------------------------------------------
+
+def _init_state():
+    defaults = {
+        "cv_text": None,
+        "analysis": None,
+        "job_description": "",
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+_init_state()
+
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
+
+def _sidebar():
+    with st.sidebar:
+        st.title("⚙️ Settings & Info")
+        st.divider()
+
+        st.markdown("### 🔌 Module Status")
+
+        # spaCy status
+        st.markdown(
+            f"{'✅' if _SPACY_AVAILABLE else '⚠️'} **spaCy NLP** — "
+            f"{'active' if _SPACY_AVAILABLE else 'not installed (keyword-only mode)'}"
+        )
+
+        # Hugging Face NER status  (Issue #1 — new row)
+        _hf = is_hf_available()
+        st.markdown(
+            f"{'✅' if _hf else '⚠️'} **HF Transformer NER** (SRS CV-FR-01) — "
+            f"{'active (dslim/bert-base-NER)' if _hf else 'not installed (SRS non-compliant)'}"
+        )
+
+        # Sentence Transformers status
+        st.markdown(
+            f"{'✅' if is_similarity_available() else '⚠️'} **Sentence Transformers** — "
+            f"{'active' if is_similarity_available() else 'not installed (similarity = 0)'}"
+        )
+
+        missing_any = not _SPACY_AVAILABLE or not _hf or not is_similarity_available()
+        if missing_any:
+            with st.expander("📦 Install missing dependencies"):
+                st.code(
+                    "pip install spacy sentence-transformers scikit-learn transformers torch\n"
+                    "python -m spacy download en_core_web_sm",
+                    language="bash",
+                )
+
+        st.divider()
+        st.markdown("### 📋 Job Description")
+        st.markdown("Paste a job description for a more accurate similarity match:")
+        jd = st.text_area(
+            "Job Description",
+            value=st.session_state.job_description,
+            height=200,
+            placeholder="Paste the job description here...",
+            label_visibility="collapsed",
+        )
+        st.session_state.job_description = jd
+
+        st.divider()
+        st.markdown("**Tip:** The more complete your CV, the better the analysis.")
+        st.markdown("Supported formats: **PDF**, **DOCX** (max 5 MB)")
+
+# ---------------------------------------------------------------------------
+# File upload & text extraction
+# ---------------------------------------------------------------------------
+
+def _upload_section():
+    st.subheader("📤 Upload Your Resume")
+
+    uploaded = st.file_uploader(
+        "Select a PDF or DOCX file (max 5 MB)",
+        type=["pdf", "docx"],
+        help="Supported: PDF, DOCX",
+    )
+
+    if uploaded is None:
+        return
+
+    size_mb = get_file_size_mb(uploaded)
+    valid, err_msg = validate_file(uploaded.name, size_mb)
+
+    if not valid:
+        st.error(f"❌ {err_msg}")
+        return
+
+    try:
+        with st.spinner("🔄 Extracting text from file…"):
+            file_bytes = uploaded.read()
+            cv_text = extract_text_from_bytes(file_bytes, uploaded.name)
+
+        if not cv_text or len(cv_text.strip()) < 50:
+            st.error(
+                "❌ Could not extract meaningful text. "
+                "Make sure the file isn't scanned/image-only."
+            )
+            return
+
+        if cv_text != st.session_state.cv_text:
+            st.session_state.cv_text = cv_text
+            st.session_state.analysis = None
+
+        st.success(f"✅ File processed — {len(cv_text.split())} words extracted.")
+
+    except Exception as e:
+        logger.exception("File processing failed")
+        st.error(f"❌ Error processing file: {e}")
+
+# ---------------------------------------------------------------------------
+# Core analysis pipeline
+# ---------------------------------------------------------------------------
+
+def _run_analysis() -> dict:
+    """Run all analysis modules and return results dict."""
+    text = st.session_state.cv_text
+    jd = st.session_state.job_description or None
+
+    with st.spinner("🧠 Analysing CV… (HF NER may take a few seconds on first run)"):
+        skills = extract_skills(text)
+        skills.setdefault("technical", [])
+        skills.setdefault("soft", [])
+
+        score_result = calculate_score(text, skills)
+        gaps = detect_skill_gaps(skills)
+        suggestions = generate_suggestions(score_result, skills, gaps)
+        similarity = calculate_similarity(text, jd)
+        sections = check_section_completeness(text)
+
+    return {
+        "skills": skills,
+        "score": score_result,
+        "gaps": gaps,
+        "suggestions": suggestions,
+        "similarity": similarity,
+        "sections": sections,
+    }
+
+# ---------------------------------------------------------------------------
+# Display helpers
+# ---------------------------------------------------------------------------
+
+def _display_score(score_result: dict):
+    st.subheader("📊 CV Quality Score")
+
+    score = score_result["score"]
+    bd = score_result["breakdown"]
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Overall Score", f"{score} / 100")
+        st.progress(min(score / 100, 1.0))
+        if score >= 80:
+            st.caption("🟢 Excellent")
+        elif score >= 60:
+            st.caption("🟡 Good")
+        else:
+            st.caption("🔴 Needs Improvement")
+
+    with col2:
+        st.metric("Word Count", bd["word_count"])
+
+    with col3:
+        reading_time = max(1, bd["word_count"] // 200)
+        st.metric("Est. Reading Time", f"~{reading_time} min")
+
+    # ── Primary: 4 SRS dimension scores ─────────────────────────────────────
+    st.markdown("#### Score Breakdown (SRS CV-FR-02 — 4 Dimensions)")
+
+    import pandas as pd
+
+    srs_dims = {
+        "keywords_score":      ("Keywords & ATS",   0.30),
+        "completeness_score":  ("Section Coverage", 0.25),
+        "skill_density_score": ("Skill Density",    0.25),
+        "formatting_score":    ("Formatting",        0.20),
+    }
+
+    rows = []
+    for key, (label, weight) in srs_dims.items():
+        val = bd.get(key, 0)
+        rows.append({
+            "Dimension (SRS)": label,
+            "Score": val,
+            "Weight": f"{int(weight*100)}%",
+            "Weighted": round(val * weight, 1),
+        })
+
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    try:
+        import plotly.graph_objects as go
+
+        fig = go.Figure(
+            go.Bar(
+                x=[r["Dimension (SRS)"] for r in rows],
+                y=[r["Score"] for r in rows],
+                marker_color=["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"],
+                text=[f"{r['Score']}" for r in rows],
+                textposition="outside",
+            )
+        )
+        fig.update_layout(
+            title="SRS Dimension Scores",
+            yaxis=dict(range=[0, 110], title="Score (0–100)"),
+            xaxis_tickangle=-15,
+            height=380,
+            margin=dict(t=50, b=60),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    except ImportError:
+        st.info("Install plotly for chart visualization: pip install plotly")
+
+    # ── Secondary: UI detail sub-scores in expander ──────────────────────────
+    with st.expander("🔍 Detailed sub-scores (display only)"):
+        detail_keys = {
+            "experience_score":      "Experience",
+            "education_score":       "Education",
+            "keyword_density_score": "Keyword Density",
+            "projects_score":        "Projects",
+        }
+        detail_rows = [
+            {"Component": label, "Score": bd.get(key, 0)}
+            for key, label in detail_keys.items()
+        ]
+        st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
+        st.caption(
+            "These sub-scores are for information only and do not affect the overall "
+            "weighted total, which is computed from the 4 SRS dimensions above."
+        )
+
+
+def _display_sections(sections_result: dict):
+    st.subheader("📋 CV Section Completeness")
+    secs = sections_result["sections"]
+    pct = sections_result["completeness_percentage"]
+
+    st.progress(pct / 100)
+    st.caption(
+        f"{sections_result['completed_count']} / {sections_result['total_expected']} "
+        f"sections detected ({pct}%)"
+    )
+
+    cols = st.columns(4)
+    for i, (name, present) in enumerate(secs.items()):
+        with cols[i % 4]:
+            icon = "✅" if present else "❌"
+            st.markdown(f"{icon} **{name.capitalize()}**")
+
+
+def _display_skills(extracted_skills: dict):
+    st.subheader("🎯 Extracted Skills")
+    _hf_active = is_hf_available()
+    st.caption(
+        f"Extraction pipeline: keyword matching"
+        f"{' + spaCy NER' if _SPACY_AVAILABLE else ''}"
+        f"{' + HF BERT NER ✅' if _hf_active else ' (HF NER ⚠️ not installed)'}"
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("#### 🔧 Technical Skills")
+        tech = extracted_skills.get("technical", [])
+        if tech:
+            for i in range(0, len(tech), 3):
+                row = tech[i:i+3]
+                cols = st.columns(len(row))
+                for j, skill in enumerate(row):
+                    with cols[j]:
+                        st.markdown(
+                            f'<span style="background:#1f77b420;border:1px solid #1f77b4;'
+                            f'border-radius:12px;padding:2px 10px;font-size:0.85em">{skill}</span>',
+                            unsafe_allow_html=True,
+                        )
+                st.write("")
+        else:
+            st.info("No technical skills detected")
+
+    with col2:
+        st.markdown("#### 🤝 Soft Skills")
+        soft = extracted_skills.get("soft", [])
+        if soft:
+            for i in range(0, len(soft), 3):
+                row = soft[i:i+3]
+                cols = st.columns(len(row))
+                for j, skill in enumerate(row):
+                    with cols[j]:
+                        st.markdown(
+                            f'<span style="background:#2ca02c20;border:1px solid #2ca02c;'
+                            f'border-radius:12px;padding:2px 10px;font-size:0.85em">{skill}</span>',
+                            unsafe_allow_html=True,
+                        )
+                st.write("")
+        else:
+            st.info("No soft skills detected")
+
+
+def _display_gaps(gaps: dict):
+    st.subheader("⚠️ Skill Gap Analysis")
+
+    coverage = gaps["coverage_percentage"]
+    st.markdown(
+        f"**High-demand skill coverage:** {gaps['user_has_high_demand_count']} / "
+        f"{gaps['total_high_demand']} ({coverage}%)"
+    )
+    st.progress(coverage / 100)
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("#### 🔴 High-Priority Missing Skills")
+        hp = gaps.get("high_priority_skills", [])
+        if hp:
+            for skill in hp[:8]:
+                st.error(f"🔴 {skill}")
+        else:
+            st.success("✅ All high-demand skills covered!")
+
+    with col2:
+        st.markdown("#### 🟡 Emerging Skills to Consider")
+        em = gaps.get("emerging_missing_skills", [])
+        if em:
+            for skill in em[:8]:
+                st.warning(f"🟡 {skill}")
+        else:
+            st.success("✅ Good emerging skills coverage!")
+
+    try:
+        import plotly.graph_objects as go
+
+        have = gaps["user_has_high_demand_count"]
+        missing = gaps["total_high_demand"] - have
+
+        fig = go.Figure(
+            go.Pie(
+                labels=["Skills You Have", "Skills Missing"],
+                values=[have, missing],
+                hole=0.55,
+                marker_colors=["#2ca02c", "#d62728"],
+                textinfo="label+percent",
+            )
+        )
+        fig.update_layout(
+            title="High-Demand Skill Coverage",
+            height=350,
+            margin=dict(t=50, b=20, l=20, r=20),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    except ImportError:
+        pass
+
+
+def _display_suggestions(suggestions: list):
+    st.subheader("💡 Improvement Suggestions")
+
+    high   = [s for s in suggestions if s["priority"] == "High"]
+    medium = [s for s in suggestions if s["priority"] == "Medium"]
+    low    = [s for s in suggestions if s["priority"] == "Low"]
+
+    if high:
+        st.markdown("#### 🔴 High Priority")
+        for s in high:
+            st.error(f"**[{s['category']}]** {s['message']}")
+
+    if medium:
+        st.markdown("#### 🟡 Medium Priority")
+        for s in medium:
+            st.warning(f"**[{s['category']}]** {s['message']}")
+
+    if low:
+        st.markdown("#### 🟢 Low Priority")
+        for s in low:
+            st.info(f"**[{s['category']}]** {s['message']}")
+
+    if not suggestions:
+        st.success("🎉 No major issues found — your CV looks great!")
+
+
+def _display_similarity(similarity_score: float):
+    st.subheader("🔍 CV–Job Match (Semantic Similarity)")
+
+    using_sample = not (
+        st.session_state.job_description
+        and st.session_state.job_description.strip()
+    )
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        st.metric("Match Score", f"{similarity_score}%")
+        if not is_similarity_available():
+            st.warning("⚠️ sentence-transformers not installed — score is 0.")
+
+    with col2:
+        if not is_similarity_available():
+            st.info("Install sentence-transformers to enable semantic matching.")
+        elif similarity_score >= 70:
+            st.success(f"✅ Strong match ({similarity_score}%)")
+        elif similarity_score >= 50:
+            st.warning(f"⚠️ Moderate match — add more industry keywords ({similarity_score}%)")
+        else:
+            st.error(f"❌ Low match — tailor CV to the job description ({similarity_score}%)")
+
+        if using_sample:
+            st.caption(
+                "ℹ️ Using the built-in sample job description. "
+                "Paste a real JD in the sidebar for a more accurate score."
+            )
+
+
+def _export_section(analysis: dict):
+    st.markdown("---")
+    st.subheader("📥 Export Analysis Report")
+
+    report = {
+        "overall_score": analysis["score"]["score"],
+        "score_breakdown": analysis["score"]["breakdown"],
+        "extracted_skills": analysis["skills"],
+        "section_completeness": analysis["sections"],
+        "skill_gaps": {
+            "high_priority_missing": analysis["gaps"]["high_priority_skills"],
+            "emerging_missing": analysis["gaps"]["emerging_missing_skills"],
+            "coverage_percentage": analysis["gaps"]["coverage_percentage"],
+        },
+        "suggestions": analysis["suggestions"],
+        "similarity_score": analysis["similarity"],
+    }
+
+    st.download_button(
+        label="⬇️ Download JSON Report",
+        data=json.dumps(report, indent=2),
+        file_name="cv_analysis_report.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    _sidebar()
+
+    st.title("📄 AI-Powered CV Analyzer")
+    st.markdown(
+        "Upload your resume to get an **AI-driven quality score**, "
+        "**skill gap analysis**, and **actionable improvement suggestions**."
+    )
+    st.divider()
+
+    _upload_section()
+
+    if st.session_state.cv_text is None:
+        st.info("👆 Upload your CV above to get started.")
+        return
+
+    st.divider()
+
+    if st.button("🚀 Analyse CV", type="primary", use_container_width=True):
+        try:
+            st.session_state.analysis = _run_analysis()
+        except Exception as e:
+            logger.exception("Analysis pipeline failed")
+            st.error(f"❌ Analysis failed: {e}")
+            return
+
+    if st.session_state.analysis is None:
+        st.info("Click **Analyse CV** to begin.")
+        return
+
+    analysis = st.session_state.analysis
+
+    st.divider()
+    _display_score(analysis["score"])
+
+    st.divider()
+    _display_sections(analysis["sections"])
+
+    st.divider()
+    _display_skills(analysis["skills"])
+
+    st.divider()
+    _display_gaps(analysis["gaps"])
+
+    st.divider()
+    _display_suggestions(analysis["suggestions"])
+
+    st.divider()
+    _display_similarity(analysis["similarity"])
+
+    _export_section(analysis)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+and this is my 
+requirement.txt:
+altair==5.5.0
+annotated-doc==0.0.4
+annotated-types==0.7.0
+attrs==26.1.0
+black==23.9.1
+blinker==1.9.0
+blis==0.7.11
+cachetools==5.5.2
+catalogue==2.0.10
+certifi==2026.2.25
+cffi==2.0.0
+charset-normalizer==3.4.7
+click==8.3.2
+cloudpathlib==0.23.0
+colorama==0.4.6
+confection==0.1.5
+contourpy==1.3.2
+cryptography==46.0.6
+cycler==0.12.1
+cymem==2.0.13
+en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl#sha256=86cc141f63942d4b2c5fcee06630fd6f904788d2f0ab005cce45aadb8fb73889
+exceptiongroup==1.3.1
+filelock==3.25.2
+flake8==6.1.0
+fonttools==4.62.1
+fsspec==2026.3.0
+gitdb==4.0.12
+GitPython==3.1.46
+huggingface_hub==0.36.2
+idna==3.11
+importlib-metadata==6.11.0
+iniconfig==2.3.0
+Jinja2==3.1.6
+joblib==1.5.3
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
+kiwisolver==1.5.0
+langcodes==3.5.1
+lxml==6.0.2
+markdown-it-py==4.0.0
+MarkupSafe==3.0.3
+matplotlib==3.7.2
+mccabe==0.7.0
+mdurl==0.1.2
+mpmath==1.3.0
+murmurhash==1.0.15
+mypy_extensions==1.1.0
+narwhals==2.18.1
+networkx==3.4.2
+nltk==3.9.4
+numpy==1.24.3
+packaging==23.2
+pandas==2.0.3
+pathlib_abc==0.5.2
+pathspec==1.0.4
+pathy==0.13.0
+pdfminer.six==20221105
+pdfplumber==0.10.3
+pillow==10.4.0
+platformdirs==4.9.4
+pluggy==1.6.0
+preshed==3.0.13
+protobuf==4.25.9
+pyarrow==23.0.1
+pycodestyle==2.11.1
+pycparser==3.0
+pydantic==2.12.5
+pydantic_core==2.41.5
+pydeck==0.9.1
+pyflakes==3.1.0
+Pygments==2.20.0
+pyparsing==3.0.9
+pypdfium2==5.6.0
+pytest==7.4.0
+python-dateutil==2.9.0.post0
+python-docx==0.8.11
+python-dotenv==1.0.0
+pytz==2026.1.post1
+PyYAML==6.0.3
+referencing==0.37.0
+regex==2026.4.4
+requests==2.31.0
+rich==13.9.4
+rpds-py==0.30.0
+safetensors==0.7.0
+scikit-learn==1.3.0
+scipy==1.15.3
+sentencepiece==0.2.1
+shellingham==1.5.4
+six==1.17.0
+smart-open==6.4.0
+smmap==5.0.3
+spacy-legacy==3.0.12
+spacy-loggers==1.0.5
+srsly==2.5.3
+streamlit==1.28.1
+sympy==1.14.0
+tenacity==8.5.0
+threadpoolctl==3.6.0
+tokenizers==0.22.2
+toml==0.10.2
+tomli==2.4.1
+tornado==6.5.5
+tqdm==4.67.3
+transformers==4.57.6
+typer==0.24.1
+typer-slim==0.24.0
+typing-inspection==0.4.2
+typing_extensions==4.15.0
+tzdata==2026.1
+tzlocal==5.3.1
+urllib3==2.6.3
+validators==0.35.0
+wasabi==1.1.3
+watchdog==6.0.0
+weasel==0.4.3
+zipp==3.23.0
